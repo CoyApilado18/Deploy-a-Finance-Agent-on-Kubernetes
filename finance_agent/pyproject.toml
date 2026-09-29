@@ -1,0 +1,10 @@
+[project]
+name = "finance_agent"
+version = "0.1"
+description = "finance_agent agent"
+readme = "README.md"
+dependencies = [
+  "google-adk==1.28.1",
+]
+
+requires-python = ">=3.13"

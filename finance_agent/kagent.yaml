@@ -1,0 +1,7 @@
+agentName: finance_agent
+language: python
+framework: adk
+modelProvider: gemini
+modelName: gemini-3.6-flash
+description: ""
+updatedAt: 2026-09-29T04:41:37.785432594-05:00

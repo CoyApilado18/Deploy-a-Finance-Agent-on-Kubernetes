@@ -1,0 +1,19 @@
+{
+  "name": "finance_agent",
+  "description": "A finance_agent agent",
+  "url": "localhost:8080",
+  "version": "0.0.1",
+  "capabilities": {
+    "streaming": true
+  },
+  "defaultInputModes": ["text"],
+  "defaultOutputModes": ["text"],
+  "skills": [
+    {
+      "id": "finance_agent",
+      "name": "finance_agent",
+      "description": "A finance_agent agent",
+      "tags": ["finance_agent"]
+    }
+  ]
+}
