@@ -1,0 +1,381 @@
+STEP 3 FIX SUMMARY: Deploy a Finance Agent on Kubernetes
+=========================================================
+Date: 2026-10-01
+kagent CLI version: 0.10.2 (base image ghcr.io/kagent-dev/kagent/kagent-adk:0.10.2)
+Scope: Step 3, "Scaffold and Run Your Finance Agent Locally"
+
+Result: the finance agent now builds, starts, and answers chat messages
+locally. Three problems in the project files would have stopped it from
+working, and the README had several errors. All changes are uncommitted.
+
+
+-------------------------------------------------------------------------
+OVERVIEW
+-------------------------------------------------------------------------
+File                                         Problem                         Status
+-------------------------------------------  ------------------------------  ------
+finance_agent/finance_agent/agent-card.json  Agent crashed on startup        Fixed
+finance_agent/kagent.yaml                    Used a format the CLI ignores   Fixed
+finance_agent/Dockerfile                     Image would not build           Fixed
+.gitignore                                   Empty; API key could be         Fixed
+                                             committed by accident
+finance_agent/.env                           kagent run started agent with   Fixed
+                                             an empty GOOGLE_API_KEY
+README.md                                    Broken code, wrong config,      Fixed
+                                             typos, missing run section
+
+
+-------------------------------------------------------------------------
+FIX 1: agent-card.json (agent crashed on startup)
+-------------------------------------------------------------------------
+File: finance_agent/finance_agent/agent-card.json
+
+WHAT WAS WRONG
+  We had cut the agent card down to three fields:
+      { "name": ..., "description": ..., "version": ... }
+
+  When the kagent runtime starts (kagent-adk cli.py, the "run" command),
+  it does this:
+      agent_card = AgentCard.model_validate(json.load(f))
+  That checks the file against the A2A (Agent-to-Agent protocol)
+  AgentCard schema. I ran that check inside the real runtime image, and
+  our three-field card failed:
+      5 validation errors for AgentCard
+      capabilities        Field required
+      defaultInputModes   Field required
+      defaultOutputModes  Field required
+      skills              Field required
+      url                 Field required
+  The container would have crashed before serving a single request.
+
+WHY THE FIELDS MATTER
+  The agent card is the agent's "business card" in the A2A protocol.
+  Other agents, the kagent controller, and the dashboard fetch it from
+  /.well-known/agent-card.json to find out:
+    - where the agent lives (url)
+    - what it supports (capabilities, e.g. streaming)
+    - what kinds of input and output it handles (defaultInput/OutputModes)
+    - what it can do (skills)
+
+WHAT I DID
+  Put the full structure back with finance-specific values:
+    - name: "finance_agent". This matches the agent name in agent.py and
+      the project name. The earlier "finance_research_agent" didn't
+      match.
+    - description: the finance research description
+    - version: 0.1.0
+    - a skill named "stock_research", tagged finance/stocks/market-data
+
+VERIFIED
+  Ran AgentCard.model_validate inside the kagent-adk image, and the
+  result was VALID. The running agent also serves the card at
+  http://localhost:8080/.well-known/agent-card.json (HTTP 200).
+
+
+-------------------------------------------------------------------------
+FIX 2: kagent.yaml (we had made up our own format)
+-------------------------------------------------------------------------
+File: finance_agent/kagent.yaml
+
+WHAT WAS WRONG
+  We had rewritten the file in a format that kagent 0.10.2 doesn't use:
+      name: finance_agent
+      model:
+        provider: Gemini
+        name: gemini-3.6-flash
+      mcp_servers:
+        - name: finnhub-tools
+          command: python
+          args: ["-m", "finnhub_tools"]
+
+  The CLI that `kagent init` generated uses different keys:
+      agentName, language, framework, modelProvider, modelName,
+      description (and mcpServers for tools)
+
+  There were two problems:
+    a) The CLI wouldn't recognise our keys, so they would be ignored or
+       cause errors in kagent run, build, and deploy.
+    b) Even in the right format, declaring "finnhub-tools" now would be
+       wrong. The server doesn't exist yet. The generated mcp_tools.py
+       would point the agent at http://finnhub-tools:3000/mcp, and the
+       agent would fail trying to connect to it.
+
+HOW MCP SERVERS ARE MEANT TO BE ADDED
+  You don't add them by hand. The `kagent add-mcp` command (flags:
+  --command, --arg, --env, --build, --image, --remote) writes the
+  mcpServers entry into kagent.yaml. kagent then regenerates
+  finance_agent/mcp_tools.py and docker-compose.yaml from it. We'll do
+  that in Step 4, once the Finnhub server exists.
+
+WHAT I DID
+  Went back to the CLI's own format and filled in the empty description:
+      agentName: finance_agent
+      language: python
+      framework: adk
+      modelProvider: gemini
+      modelName: gemini-3.6-flash
+      description: "A finance research agent that fetches real-time
+                    stock data and provides market analysis."
+  (The original also had an updatedAt timestamp line, which the CLI
+  maintains itself.)
+
+
+-------------------------------------------------------------------------
+FIX 3: Dockerfile (image would not build)
+-------------------------------------------------------------------------
+File: finance_agent/Dockerfile
+
+WHAT WAS WRONG
+  Both `kagent run` and `kagent build` build from this Dockerfile. The
+  build failed at:
+      RUN uv sync
+  with the error:
+      runc run failed: ... exec: "/bin/sh": stat /bin/sh:
+      no such file or directory
+      failed to solve: process "/bin/sh -c uv sync" did not complete
+      successfully: exit code: 1
+
+ROOT CAUSE
+  The base image ghcr.io/kagent-dev/kagent/kagent-adk:0.10.2 is
+  "distroless". To keep the attack surface small, it contains only
+  Python and the agent runtime. I inspected the image and confirmed:
+    - there is no /bin/sh
+    - there is no uv
+    - PATH=/.kagent/.venv/bin:...
+    - ENTRYPOINT = kagent-adk run --host 0.0.0.0 --port 8080
+    - it runs as non-root user 65532
+  A shell-form RUN instruction ("RUN uv sync") needs /bin/sh, so it
+  can't run on this image.
+
+WHY REMOVING THE STEP IS SAFE
+  - Our only dependency (pyproject.toml) is google-adk.
+  - The base image's virtualenv already includes google-adk 1.38.0
+    (plus kagent-adk 0.3.0).
+  - uv sync would actually have DOWNGRADED google-adk to the 1.28.1
+    pinned in pyproject.toml, giving us an older ADK than the runtime
+    was built against.
+
+WHAT I DID
+  Replaced the "RUN uv sync" line with this comment:
+      # The kagent-adk base image is distroless (no /bin/sh, no uv) and
+      # already ships google-adk in /.kagent/.venv, so there is nothing
+      # to install here.
+
+CAVEAT
+  The Dockerfile header says "AUTOGENERATED FILE: DO NOT EDIT".
+  Re-running `kagent init` would overwrite this fix, so apply it again
+  if you ever re-scaffold.
+
+FOLLOW-UP TO CONSIDER
+  pyproject.toml still pins google-adk==1.28.1. That only affects your
+  local .venv (VS Code autocomplete), not the container. You could bump
+  it to 1.38.0 so your editor matches the runtime.
+
+
+-------------------------------------------------------------------------
+FIX 4: .gitignore (protect the API key)
+-------------------------------------------------------------------------
+File: .gitignore (repo root). It was tracked but empty.
+
+WHAT WAS WRONG
+  finance_agent/.env.local (now renamed to .env, see Fix 6) contains
+  your real GOOGLE_API_KEY and was untracked. A `git add .` would have committed the key to the repo.
+
+WHAT I DID
+  Added:
+      .env          (was .env.local before Fix 6)
+      .venv/
+      __pycache__/
+
+
+-------------------------------------------------------------------------
+FIX 5: README.md
+-------------------------------------------------------------------------
+CODE ERRORS FIXED
+  - The import was wrong:
+        from .mcp_tools import mcp_tools        (wrong: no such name)
+        from .mcp_tools import get_mcp_tools    (correct)
+    The next snippet calls get_mcp_tools(), so the old import would
+    raise NameError/ImportError.
+  - The `root_agent = Agent(` snippet was missing its closing ")",
+    which is a SyntaxError if copied as written.
+  - The kagent.yaml and agent-card.json snippets now match the working
+    files from Fixes 1 and 2, with "why" notes explaining them.
+  - Code blocks are now tagged with their real language (python, yaml,
+    json, dockerfile) instead of all being tagged "bash".
+
+INACCURATE TEXT FIXED
+  - The "scaffolded project" notes said docker-compose maps keys from
+    .env.local and already runs the Finnhub container. Neither is true
+    yet. The text now describes what each file actually does, and adds
+    entries for the Dockerfile and the auto-generated mcp_tools.py.
+  - The pyproject.toml note said `kagent build` installs dependencies
+    from it. With the distroless base image, it doesn't. Reworded.
+  - The secret command placeholder "our-gemini-api-key-here" is now
+    "your-gemini-api-key-here".
+
+TYPOS FIXED
+  "ust" -> "just", "ywe" -> "we", "oour" -> "our",
+  "the the" -> "the", "debubg" and "dependecies" (removed when the
+  paragraphs were rewritten).
+
+NEW SECTIONS ADDED
+  - "Fix the Dockerfile (kagent v0.10.2)": the error, the cause, and
+    the fix.
+  - "Run the agent locally and chat with it":
+      * export GOOGLE_API_KEY (docker-compose reads it from the shell,
+        not from .env.local). Later replaced by a single .env file,
+        see Fix 6.
+      * kagent run . --build, and why --build matters
+      * a sample question and the agent's actual reply
+      * troubleshooting: Gemini 503 overload, "GOOGLE_API_KEY variable
+        is not set", checking the agent card with curl, docker compose
+        logs and down
+
+
+-------------------------------------------------------------------------
+FIX 6: "No API key was provided" in the kagent run chat
+-------------------------------------------------------------------------
+Files: finance_agent/.env (renamed from .env.local), .gitignore,
+       README.md
+
+SYMPTOM
+  `kagent run` opened the chat, but every message got this reply:
+      No API key was provided. Please pass a valid API key.
+
+WHAT WAS WRONG
+  `docker inspect` on the container that `kagent run` created showed:
+      GOOGLE_API_KEY=        (empty)
+  docker-compose.yaml passes the key with:
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+  docker compose fills in ${...} values from only two places:
+    1. variables exported in the terminal that ran the command
+    2. a file named exactly ".env" in the project folder
+  The key was in ".env.local", which nothing loads automatically, so
+  compose filled in an empty string and Gemini rejected the request.
+
+WHICH FILE KAGENT READS (checked against the kagent 0.10.2 binary)
+  kagent run     -> docker compose -> auto-loads ".env" only
+  kagent deploy  -> only the file you pass with --env-file
+                    (its help text uses: --env-file .env)
+  kagent build   -> no keys; they are never baked into the image
+  The only places ".env.local" appears in the binary are templates: an
+  .env example generated by `kagent mcp init` ("Copy this file to
+  .env.local") and .gitignore templates. No command loads it.
+
+WHAT I DID
+  - Renamed finance_agent/.env.local to finance_agent/.env, so it's one
+    file holding both GOOGLE_API_KEY and FINNHUB_API_KEY. (A symlink
+    .env -> .env.local was tried first, then dropped as confusing.)
+  - .gitignore now ignores .env (plus .venv/ and __pycache__/).
+  - README: the "Create the environment file" step now writes .env, and
+    explains why the name must be .env. The other .env.local
+    references now say .env.
+  - Use `kagent deploy . --env-file .env` when deploying.
+
+VERIFIED
+  - With nothing exported, `docker compose config` resolves
+    GOOGLE_API_KEY from .env.
+  - Recreated the container: GOOGLE_API_KEY is set inside it.
+  - Test chat message completed, and Gemini answered: "I am a financial
+    research assistant that fetches real-time stock market data,
+    compares company metrics, and provides clear market analysis..."
+
+
+-------------------------------------------------------------------------
+FIX 7: README fixes restored after an overwrite
+-------------------------------------------------------------------------
+WHAT HAPPENED
+  At 21:08 the README was saved from an editor buffer that predated
+  Fix 5. That undid all the Fix 5 changes (typos, wrong import, missing
+  ")", the old kagent.yaml format, the 3-field agent card, the
+  Dockerfile and troubleshooting sections). The same save also added
+  new content: "Create the environment file and run the agent" and the
+  start of Step 4.
+
+WHAT I DID
+  Merged the two versions instead of picking one:
+  - Restored every Fix 5 change.
+  - Kept the new .env section and the Step 4 start, with these
+    corrections:
+      * The run command is `kagent build . && kagent run .`, run from
+        inside finance_agent/. The old `./finance_agent` paths only
+        worked from the repo root, but the README has the reader cd
+        into the project.
+      * Removed the claim that the finnhub-tools MCP server "will fail
+        to start". No MCP server is declared yet, so the agent just
+        starts with an empty tool list.
+      * Added the agent's real replies to "Hello, what can you do?"
+        and the AAPL question.
+      * The Step 4 intro now says the agent told us it couldn't look
+        prices up. It no longer says the agent "could only guess".
+  - Troubleshooting now covers the missing API key, Gemini 503,
+    AgentCard validation errors, and the /bin/sh build error.
+  - Typos you had already fixed yourself ("ywe", "oour") were kept.
+
+VERIFIED
+  - The agent.py, agent-card.json and kagent.yaml snippets in the README
+    match the real working files exactly.
+  - All code fences are balanced (50).
+  - `kagent build .` succeeds with the patched Dockerfile.
+  - Backup of the pre-merge README:
+    <scratchpad>/README.before-merge.md (temporary, session only)
+
+
+-------------------------------------------------------------------------
+FIX 8: .env.local + compose override (tried, then reverted)
+-------------------------------------------------------------------------
+I briefly moved the keys to .env.local and loaded them through a
+docker-compose.override.yaml (env_file + environment: !override). It
+worked, but it added an extra file to maintain and gave no extra git
+protection: .env is already git-ignored. It was reverted at your
+request, so the project is back to the single .env setup from Fix 6.
+
+Lessons from the attempt, useful for Step 4:
+  - `kagent add-mcp` regenerates docker-compose.yaml and erases manual
+    edits, so never hand-edit that file.
+  - `kagent run` does load docker-compose.override.yaml if one exists.
+  - The generated finnhub-tools service gets NO environment, even with
+    `kagent add-mcp --env FINNHUB_API_KEY=...`. We'll need a way to
+    pass FINNHUB_API_KEY to that container in Step 4.
+
+
+-------------------------------------------------------------------------
+TESTING
+-------------------------------------------------------------------------
+1. Cluster check: all kagent pods in the "kagent" namespace are Running
+   (controller, UI, tools, postgresql, and the demo agents).
+2. Built and started the agent with docker compose using the same
+   compose file kagent run uses. The server logged
+   "Uvicorn running on http://0.0.0.0:8080".
+3. GET /.well-known/agent-card.json returned 200 with the new card.
+4. Sent "What is the current price of AAPL?" over A2A JSON-RPC
+   (message/stream):
+     - First attempt: Gemini returned "503 UNAVAILABLE ... high demand".
+       That's a temporary problem on Google's side, not our setup.
+     - Retry: the task completed. The agent answered in the persona's
+       format (Summary / Market Data / Analysis / Caveat) and said it
+       has no live stock quote tool rather than making up a price.
+       This is the expected Step 3 result: right persona, no tools yet.
+
+NOT TESTED
+  The interactive `kagent run` chat screen. It needs a real terminal.
+  Run `kagent run . --build` yourself to confirm it works.
+
+CURRENT STATE
+  The agent container (finance_agent-finance_agent-1) is still running
+  on port 8080. To stop it, run this from finance_agent/:
+      docker compose down
+
+
+-------------------------------------------------------------------------
+NEXT STEPS (Step 4)
+-------------------------------------------------------------------------
+1. Get a free Finnhub API key at finnhub.io and put it in
+   FINNHUB_API_KEY in finance_agent/.env.
+2. Build the Finnhub MCP tool server: stock quote, company profile,
+   and analyst recommendation trends.
+3. Register it with `kagent add-mcp` (don't edit kagent.yaml by hand).
+4. Re-run the agent and confirm it returns real prices.
+5. Then: kagent build, and kagent deploy . --env-file .env to the
+   cluster.

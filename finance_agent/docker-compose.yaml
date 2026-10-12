@@ -3,19 +3,26 @@
 # Any changes to this file will be overwritten.
 
 services:
-  finance_agent:
-    image: localhost:5001/finance_agent:latest
+  finance-agent:
+    image: localhost:5001/finance-agent:latest
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["finance_agent", "--local"]
+    command: ["finance-agent", "--local"]
     ports:
       - "8080:8080"
     environment:
-      - AGENT_NAME=finance_agent
+      - AGENT_NAME=finance-agent
       - MODEL_PROVIDER=gemini
       - MODEL_NAME=gemini-3.6-flash
       - KAGENT_URL=${KAGENT_URL:-http://localhost:8083}
-      - KAGENT_NAME=finance_agent
+      - KAGENT_NAME=finance-agent
       - KAGENT_NAMESPACE=${KAGENT_NAMESPACE:-kagent}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+  finnhub-tools:
+    image: localhost:5001/finance-agent-finnhub-tools:latest
+    build:
+      context: ./finnhub-tools
+      dockerfile: Dockerfile
+    expose:
+      - "3000"

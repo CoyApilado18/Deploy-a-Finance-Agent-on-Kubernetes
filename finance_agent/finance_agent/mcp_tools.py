@@ -11,7 +11,15 @@ from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StreamableHTTPConn
 
 # MCP Server configuration generated from kagent.yaml
 _MCP_SERVERS = [
+    {
+        "name": "finnhub-tools",
+        "type": "command",
+    },
 ]
+
+# The finnhub-tools server is started fresh (stdio) for every MCP session and
+# takes ~4-5 s to boot, which is right at ADK's 5 s default connect timeout.
+_MCP_CONNECT_TIMEOUT = 30.0
 
 
 def _resolve_env_vars(value: str) -> str:
@@ -77,9 +85,9 @@ def get_mcp_tools(
         
         # Create connection params with headers if present
         if headers:
-            connection_params = StreamableHTTPConnectionParams(url=url, headers=headers)
+            connection_params = StreamableHTTPConnectionParams(url=url, headers=headers, timeout=_MCP_CONNECT_TIMEOUT)
         else:
-            connection_params = StreamableHTTPConnectionParams(url=url)
+            connection_params = StreamableHTTPConnectionParams(url=url, timeout=_MCP_CONNECT_TIMEOUT)
             
         if predicate is not None:
             toolsets.append(MCPToolset(connection_params=connection_params, tool_filter=predicate))

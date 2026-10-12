@@ -11,7 +11,8 @@ WORKDIR /app
 COPY pyproject.toml pyproject.toml
 COPY .python-version .python-version
 
-RUN uv sync
+# The kagent-adk base image is distroless (no /bin/sh, no uv) and already ships
+# google-adk in /.kagent/.venv, so there is nothing to install here.
 
 COPY finance_agent/ finance_agent/
 COPY README.md README.md

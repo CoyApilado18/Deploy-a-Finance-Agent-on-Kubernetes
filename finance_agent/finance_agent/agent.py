@@ -1,79 +1,30 @@
-import random
+from google.adk.agents import Agent
 
-from google.adk import Agent
-from google.adk.tools.tool_context import ToolContext
-from google.adk.models.lite_llm import LiteLlm
 from .mcp_tools import get_mcp_tools
 
+SYSTEM_PROMPT = """You are a finance research assistant that helps users analyze stocks and market data.
 
-def roll_die(sides: int, tool_context: ToolContext) -> int:
-    """Roll a die and return the rolled result.
-    Args:
-      sides: The integer number of sides the die has.
-    Returns:
-      An integer of the result of rolling the die.
-    """
-    result = random.randint(1, sides)
-    if "rolls" not in tool_context.state:
-        tool_context.state["rolls"] = []
+# Instructions
+- Use your available tools to fetch real-time stock data when users ask about prices, companies, or market trends
+- Always provide context with your data: explain what the numbers mean
+- If a user asks about a stock, fetch the current quote before answering
+- Compare stocks when asked by fetching data for each ticker
+- If you don't have a tool for something, say so clearly rather than guessing
+- Format responses in Markdown with clear sections
 
-    tool_context.state["rolls"] = tool_context.state["rolls"] + [result]
-    return result
-
-
-async def check_prime(nums: list[int]) -> str:
-    """Check if a given list of numbers are prime.
-    Args:
-      nums: The list of numbers to check.
-    Returns:
-      A str indicating which number is prime.
-    """
-    primes = set()
-    for number in nums:
-        number = int(number)
-        if number <= 1:
-            continue
-        is_prime = True
-        for i in range(2, int(number**0.5) + 1):
-            if number % i == 0:
-                is_prime = False
-                break
-        if is_prime:
-            primes.add(number)
-    return "No prime numbers found." if not primes else f"{', '.join(str(num) for num in primes)} are prime numbers."
-
-
-# Create model based on provider and model name
-
-def create_model():
-    """Create a Gemini model instance."""
-    return "gemini-3.6-flash"
-
+# Response format
+- Start with a brief summary of what you found
+- Include specific numbers (price, change %, volume) when available
+- Add your analysis of what the data suggests
+- End with any caveats (e.g., "this is real-time data, not investment advice")
+"""
 
 mcp_tools = get_mcp_tools()
+
 root_agent = Agent(
-    model=create_model(),
-    name="finance_agent_agent",
-    description=("finance_agent agent."),
-    instruction="""
-You roll dice and answer questions about the outcome of the dice rolls.
-You can roll dice of different sizes.
-You can use multiple tools in parallel by calling functions in parallel(in one request and in one round).
-It is ok to discuss previous dice roles, and comment on the dice rolls.
-When you are asked to roll a die, you must call the roll_die tool with the number of sides. Be sure to pass in an integer. Do not pass in a string.
-You should never roll a die on your own.
-When checking prime numbers, call the check_prime tool with a list of integers. Be sure to pass in a list of integers. You should never pass in a string.
-You should not check prime numbers before calling the tool.
-When you are asked to roll a die and check prime numbers, you should always make the following two function calls:
-1. You should first call the roll_die tool to get a roll. Wait for the function response before calling the check_prime tool.
-2. After you get the function response from roll_die tool, you should call the check_prime tool with the roll_die result.
-2.1 If user asks you to check primes based on previous rolls, make sure you include the previous rolls in the list.
-3. When you respond, you must include the roll_die result from step 1.
-You should always perform the previous 3 steps when asking for a roll and checking prime numbers.
-You should not rely on the previous history on prime results.
-    """,
-    tools=[
-        roll_die,
-        check_prime,
-    ] + (mcp_tools if mcp_tools else []),
+    name="finance_agent",
+    model="gemini-3.6-flash",
+    description="A finance research agent that fetches real-time stock data and provides market analysis.",
+    instruction=SYSTEM_PROMPT,
+    tools=mcp_tools,
 )

@@ -1,0 +1,65 @@
+WHY ARE THERE TWO finance_agent/ FOLDERS?
+==========================================
+Project: Deploy a Finance Agent on Kubernetes
+
+There are actually three levels, and each one has a different job. The two
+finance_agent/ folders come from `kagent init`: it names both the project
+folder and the Python package inside it after your agent.
+
+Deploy-a-Finance-Agent-on-Kubernetes/      <- 1. Git repo root (your tutorial)
+|-- README.md, images/, .gitignore, step3-fix-summary.txt
+`-- finance_agent/                         <- 2. kagent PROJECT folder (made by `kagent init`)
+    |-- kagent.yaml, Dockerfile, docker-compose.yaml
+    |-- pyproject.toml, .env
+    `-- finance_agent/                     <- 3. Python PACKAGE (the agent's code)
+        |-- __init__.py
+        |-- agent.py
+        |-- agent-card.json
+        `-- mcp_tools.py
+
+
+1. REPO ROOT (Deploy-a-Finance-Agent-on-Kubernetes/)
+-----------------------------------------------------
+This holds your tutorial and git settings. kagent doesn't care about this
+folder.
+
+
+2. PROJECT FOLDER (finance_agent/): THE ROOT FOR EVERY KAGENT COMMAND
+---------------------------------------------------------------------
+This is where kagent.yaml lives, and kagent treats the folder containing
+kagent.yaml as the project. So:
+  - Run `kagent run .`, `kagent build .`, `kagent add-mcp` and
+    `kagent deploy .` from here.
+  - .env goes here, because docker compose looks for it next to
+    docker-compose.yaml.
+
+
+3. PYTHON PACKAGE (finance_agent/finance_agent/)
+------------------------------------------------
+This is the agent's actual code. It has to have the same name as the agent:
+  - The Dockerfile copies it with: COPY finance_agent/ finance_agent/
+  - The container starts it with `kagent-adk run finance_agent`. That
+    imports the Python module "finance_agent", finds `root_agent` in
+    agent.py, and reads finance_agent/agent-card.json.
+
+If you renamed this inner folder, the agent wouldn't start. That's also why
+you shouldn't flatten the two folders into one.
+
+
+RULE OF THUMB
+-------------
+  You RUN COMMANDS from the outer finance_agent/.
+  You EDIT AGENT CODE in the inner finance_agent/.
+
+
+LOOKING AHEAD TO STEP 4
+-----------------------
+Run `kagent mcp init finnhub-tools` from the project folder
+(finance_agent/). When I tested `kagent add-mcp` earlier, the generated
+docker-compose.yaml expected the MCP server at ./finnhub-tools, relative to
+the project folder. So Step 4 will add a sibling folder:
+
+finance_agent/
+|-- kagent.yaml, docker-compose.yaml, .env ...
+|-- finance_agent/      <- agent code
+`-- finnhub-tools/      <- MCP server (Step 4)

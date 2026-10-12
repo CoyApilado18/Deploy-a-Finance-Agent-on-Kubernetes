@@ -1,0 +1,284 @@
+CALICO POD CIDR MIGRATION: 192.168.0.0/16 -> 10.244.0.0/16
+===========================================================
+Date: 2026-10-12
+Cluster: kubeadm v1.29.15, 2 nodes
+         controlplane 192.168.1.107 (Ubuntu 24.04), node01 192.168.1.225 (Ubuntu 22.04)
+         containerd, Calico v3.28.0 (manifest install, no tigera-operator)
+Scope: "Fix B" from the kagent deploy work (see kagent-deploy.txt)
+
+STATUS: COMPLETE (steps 0-8 and 10). Step 9 (cosmetic) skipped, see below.
+Result: every pod-network pod is on 10.244.x, the old pool is deleted, and
+        pods can resolve external names again. The finance agent answered
+        "What is the current price of AAPL?" with a real price from the
+        get_stock_quote tool.
+
+Who ran what:
+  Me:  steps 0, 1, 2, 3, 5, CoreDNS restart (part of step 6), all
+       verification, step 10 test.
+  You: step 4 (incl. the controller-manager crash fix and the kubeadm
+       extraArgs), step 6 (all other workloads), step 8. My session's safety
+       checks blocked me from changing kube-proxy/kubeadm-config and from
+       restarting workloads cluster-wide, and sudo needs a password.
+
+
+-------------------------------------------------------------------------
+WHY THIS MIGRATION
+-------------------------------------------------------------------------
+SYMPTOM
+  The deployed finance-agent failed its first request with:
+      Cannot connect to host generativelanguage.googleapis.com:443
+      [Temporary failure in name resolution]
+  From inside pods:
+      internal names (finnhub-tools.kagent.svc..., kubernetes.default...)  resolve
+      external names (googleapis.com, finnhub.io)                          FAIL
+      1.1.1.1:53 and 8.8.8.8:53 (TCP)                                      reachable
+      192.168.1.1:53 (home router)                                         timed out
+  From the controlplane host itself, 192.168.1.1 answered DNS normally.
+  CoreDNS logs, for every external name:
+      read udp 192.168.49.85:51471->192.168.1.1:53: i/o timeout
+
+ROOT CAUSE: pod network overlaps the home LAN
+  - Calico IP pool default-ipv4-ippool = 192.168.0.0/16 (kubeadm podSubnet,
+    controller-manager --cluster-cidr and kube-proxy clusterCIDR were all
+    192.168.0.0/16 too).
+  - The home LAN is 192.168.1.0/24 (router 192.168.1.1, nodes .107 and
+    .225). It sits INSIDE the pod range.
+  - Calico natOutgoing only SNATs traffic going to destinations OUTSIDE all
+    Calico IP pools. 192.168.1.1 counted as "inside", so DNS packets
+    reached the router with a pod source IP (e.g. 192.168.49.85). The
+    router can't route the reply back, so every lookup timed out.
+  - CoreDNS forwards external queries to the node's resolver
+    (forward . /etc/resolv.conf -> 192.168.1.1), so ALL external DNS in
+    the cluster failed, not just for the finance agent.
+
+WHY 10.244.0.0/16
+  Doesn't overlap the LAN (192.168.1.0/24), the Service range
+  (10.96.0.0/12 = 10.96.0.0-10.111.255.255), or Docker's bridge
+  (172.17.0.0/16). It's also the conventional kubeadm/flannel default.
+
+ALTERNATIVE NOT CHOSEN (Fix A)
+  Point CoreDNS at public resolvers (forward . 1.1.1.1 8.8.8.8). It's
+  quicker, but it leaves the overlap in place, which also breaks any pod
+  talking to other LAN hosts. You chose the proper fix.
+
+
+-------------------------------------------------------------------------
+CLUSTER STATE BEFORE (inspected read-only)
+-------------------------------------------------------------------------
+  Calico IPAM:          calico-ipam (Calico, not Kubernetes, assigns pod IPs)
+  IP pool:              default-ipv4-ippool 192.168.0.0/16, blockSize 26,
+                        IPIP Always, VXLAN Never, natOutgoing true, all()
+  Blocks in use:        controlplane 192.168.49.64/26
+                        node01       192.168.196.128/26
+  IPs in use:           28 of 65536
+  Pods on pod network:  17 (of 35 total; the rest are hostNetwork)
+  calico-node env:      CALICO_IPV4POOL_CIDR not set (pool already exists)
+  kubeadm-config:       podSubnet 192.168.0.0/16, serviceSubnet 10.96.0.0/12,
+                        controllerManager: {}
+  controller-manager:   --allocate-node-cidrs=true --cluster-cidr=192.168.0.0/16
+  kube-proxy:           clusterCIDR 192.168.0.0/16, mode "" (iptables)
+  Node spec.podCIDR:    controlplane 192.168.0.0/24, node01 192.168.1.0/24
+                        (not used by calico-ipam; node01's equals the LAN)
+  PVCs:                 cicd-test/cicd-test-mysql-pvc (manual)
+                        kagent/kagent-postgresql (local-path)
+
+BACKUPS (in ~/calico-migration/)
+  ippools-before.yaml                   the original IPPool resource
+  cms-before.yaml                       kube-proxy + kubeadm-config ConfigMaps
+  pods-before.txt                       kubectl get pods -A -o wide, before
+  kcm-before.yaml                       controller-manager manifest (you, step 4)
+  kubeadm-config-before-extraargs.yaml  kubeadm-config before extraArgs (you)
+  new-pool.yaml                         the new IPPool definition
+  calicoctl                             calicoctl v3.28.0 binary
+
+
+-------------------------------------------------------------------------
+WHAT WAS DONE, STEP BY STEP
+-------------------------------------------------------------------------
+STEP 0: backups (see above).
+
+STEP 1: install calicoctl v3.28.0
+  sudo needs a password in my session, so it lives in the migration folder:
+      export DATASTORE_TYPE=kubernetes KUBECONFIG=~/.kube/config
+      ~/calico-migration/calicoctl version
+  Verified: Client v3.28.0, Cluster v3.28.0, type k8s,bgp,kubeadm,kdd.
+  Optional: sudo mv ~/calico-migration/calicoctl /usr/local/bin/
+
+STEP 2: create the new pool (~/calico-migration/new-pool.yaml)
+      apiVersion: projectcalico.org/v3
+      kind: IPPool
+      metadata:
+        name: new-ipv4-ippool
+      spec:
+        cidr: 10.244.0.0/16
+        blockSize: 26
+        ipipMode: Always
+        vxlanMode: Never
+        natOutgoing: true
+        nodeSelector: all()
+  Same settings as the old pool; only the CIDR differs.
+
+STEP 3: disable the old pool
+      calicoctl patch ippool default-ipv4-ippool -p '{"spec": {"disabled": true}}'
+  Existing pods kept their IPs and kept working; new pods got 10.244.x.
+
+STEP 4: point Kubernetes at the new range (run by you)
+  a) controller-manager static pod
+       sudo cp /etc/kubernetes/manifests/kube-controller-manager.yaml ~/calico-migration/kcm-before.yaml
+       sudo sed -i 's#--cluster-cidr=192.168.0.0/16#--cluster-cidr=10.244.0.0/16#' \
+           /etc/kubernetes/manifests/kube-controller-manager.yaml
+  b) kube-proxy ConfigMap clusterCIDR -> 10.244.0.0/16, then
+       kubectl rollout restart ds/kube-proxy -n kube-system
+  c) kubeadm-config podSubnet -> 10.244.0.0/16
+
+  PROBLEM: kube-controller-manager went into CrashLoopBackOff
+    Events: Liveness probe failed ... 127.0.0.1:10257 connection refused,
+            BackOff restarting failed container
+    Logs (--previous):
+      "Error starting controller" err="failed to mark cidr[192.168.0.0/24]
+       at idx [0] as occupied for node: controlplane: cidr 192.168.0.0/24 is
+       out the range of cluster cidr 10.244.0.0/16"
+       controller="node-ipam-controller"
+      "Error starting controllers" ... (process exits)
+
+    Cause: with --allocate-node-cidrs=true the controller-manager hands out
+    node spec.podCIDR ranges from --cluster-cidr. On startup it found both
+    nodes already holding 192.168.x ranges outside the new 10.244.0.0/16,
+    and Kubernetes treats that as FATAL. (My earlier runbook wrongly said
+    this would only cause harmless warnings.)
+
+    Side effect while it was down: no Deployment/DaemonSet/ReplicaSet
+    controllers ran, so the kube-proxy rollout restart stayed pending
+    (pods were still 208 days old) and step 6 had to wait.
+
+    Fix (run by you):
+       sudo sed -i 's#--allocate-node-cidrs=true#--allocate-node-cidrs=false#' \
+           /etc/kubernetes/manifests/kube-controller-manager.yaml
+    Why safe: with calico-ipam, Calico assigns pod IPs from its own pool and
+    never reads node spec.podCIDR. kube-proxy uses clusterCIDR, not node
+    podCIDR. This is the usual setting for Calico clusters, and it avoids
+    re-registering both nodes.
+
+    Verified afterwards:
+      kube-controller-manager-controlplane  Running, 0 restarts
+        --allocate-node-cidrs=false  --cluster-cidr=10.244.0.0/16
+      kube-proxy pods recreated (the pending restart went through)
+      kube-proxy clusterCIDR: 10.244.0.0/16
+      kubeadm-config podSubnet: 10.244.0.0/16
+
+  d) kubeadm-config controllerManager.extraArgs (run by you)
+     So that a future "kubeadm upgrade", which regenerates the
+     controller-manager manifest with --allocate-node-cidrs=true, doesn't
+     crash it again:
+       kubectl get cm kubeadm-config -n kube-system -o yaml \
+         | sed 's#^    controllerManager: {}$#    controllerManager:\n      extraArgs:\n        allocate-node-cidrs: "false"#' \
+         | kubectl apply -f -
+     The ^...$ anchors only match the real 4-space-indented line, not the
+     JSON copy in the last-applied-configuration annotation.
+     Verified:
+       controllerManager:
+         extraArgs:
+           allocate-node-cidrs: "false"
+
+STEP 5: restart calico-node
+      kubectl rollout restart ds/calico-node -n kube-system
+  Each node's IPIP tunnel address (tunl0) was reallocated from the new pool:
+      controlplane  ipv4IPIPTunnelAddr: 10.244.49.64
+      node01        ipv4IPIPTunnelAddr: 10.244.196.128
+
+STEP 6: restart workloads
+  CoreDNS first (me):
+      kubectl rollout restart deploy/coredns -n kube-system
+      -> 10.244.196.129, 10.244.196.130
+  Then every other Deployment/StatefulSet/DaemonSet in all namespaces (you).
+
+  FINDING: DNS stayed broken after CoreDNS was on 10.244.x
+    CoreDNS still logged
+      read udp 10.244.196.129:56540->192.168.1.1:53: i/o timeout
+    because Calico skips natOutgoing for destinations inside ANY configured
+    IP pool, including DISABLED ones. As long as the old 192.168.0.0/16 pool
+    existed, traffic to 192.168.1.1 was still not NATed. Only step 8 fixes
+    it.
+
+STEP 7: verify nothing left on the old range
+  Pods (kubectl get pods -A, custom columns):
+      pod-network pods:   26, ALL on 10.244.x
+                          13 on controlplane (10.244.49.65-.76)
+                          13 on node01 (10.244.196.129-.144)
+      hostNetwork pods:   8 on node IPs 192.168.1.107/.225 (expected)
+      old pod IPs:        0
+      not running:        0 (db-init-job Succeeded = completed Job)
+  finance-agent 10.244.49.72, finnhub-tools 10.244.196.141,
+  kagent-postgresql 10.244.196.142, mysql 10.244.49.71 (volume data kept).
+
+  calicoctl ipam show --show-blocks:
+      IP Pool  192.168.0.0/16       0 in use
+      Block    192.168.196.128/26   0 in use
+      Block    192.168.49.64/26     0 in use
+      IP Pool  10.244.0.0/16       28 in use  (26 pods + 2 tunnel IPs)
+      Block    10.244.196.128/26   15 in use
+      Block    10.244.49.64/26     13 in use
+
+STEP 8: delete the old pool (run by you)
+      calicoctl delete ippool default-ipv4-ippool
+  Verified, only one pool remains:
+      NAME              CIDR            NAT    IPIPMODE  VXLANMODE  DISABLED
+      new-ipv4-ippool   10.244.0.0/16   true   Always    Never      false
+
+STEP 9 (optional, cosmetic): node spec.podCIDR. SKIPPED.
+  Nodes still show podCIDR 192.168.0.0/24 (controlplane) and
+  192.168.1.0/24 (node01). The field is immutable, nothing uses it now
+  (calico-ipam + --allocate-node-cidrs=false), and with allocation off the
+  controller-manager no longer checks it. To clean it up later, per node:
+      kubectl drain <node> --ignore-daemonsets --delete-emptydir-data
+      kubectl delete node <node>
+      (on that node) sudo systemctl restart kubelet
+      kubectl uncordon <node>
+  (With allocation off, re-registered nodes get NO podCIDR, which is fine.)
+
+STEP 10: test
+  DNS from the finance-agent pod:
+      generativelanguage.googleapis.com -> 172.217.116.4
+      finnhub.io                        -> 172.64.80.1
+      finnhub-tools.kagent.svc.cluster.local -> 10.109.157.85
+  CoreDNS: 0 "i/o timeout" errors in the 40 s after step 8.
+
+  End-to-end:
+      kagent invoke -a finance-agent -t "What is the current price of AAPL? Use your tools."
+  Task state: completed. Tool called: get_stock_quote. Answer (excerpt):
+      Apple Inc. (AAPL) is currently trading at $340.76, up $4.12 (+1.22%)
+      Open $338.22, Day High $342.63, Day Low $337.60, Previous Close $336.64
+  This confirms the whole chain: agent pod -> Gemini (external DNS + NAT)
+  -> MCP call to finnhub-tools:3000 (agentgateway -> stdio server) ->
+  finnhub.io with the API key.
+
+
+-------------------------------------------------------------------------
+FINAL CONFIGURATION
+-------------------------------------------------------------------------
+  Calico IP pool        new-ipv4-ippool 10.244.0.0/16 (only pool)
+  controller-manager    --cluster-cidr=10.244.0.0/16 --allocate-node-cidrs=false
+  kube-proxy            clusterCIDR: 10.244.0.0/16
+  kubeadm-config        podSubnet: 10.244.0.0/16
+                        controllerManager.extraArgs.allocate-node-cidrs: "false"
+  Service range         10.96.0.0/12 (unchanged)
+  CoreDNS Corefile      unchanged (forward . /etc/resolv.conf -> 192.168.1.1)
+
+
+-------------------------------------------------------------------------
+LESSONS / NOTES
+-------------------------------------------------------------------------
+  - Never let the pod CIDR overlap the node/LAN network. Calico's
+    natOutgoing exempts every address inside any IP pool, so LAN hosts
+    inside the pod range become unreachable from pods.
+  - A DISABLED Calico pool still counts for that NAT exemption. Delete the
+    old pool once it's empty.
+  - With --allocate-node-cidrs=true, changing --cluster-cidr while nodes
+    hold podCIDRs outside the new range crashes kube-controller-manager.
+    On Calico (calico-ipam) clusters, turn allocation off.
+  - While kube-controller-manager is down, rollout restarts silently stay
+    pending. Check it first if pods don't restart.
+  - Joining a NEW node: with allocation off it gets no podCIDR. Calico
+    doesn't need one.
+  - Rollback to the old pool is no longer possible (it's deleted). The
+    pre-migration configs are in ~/calico-migration/ for reference.

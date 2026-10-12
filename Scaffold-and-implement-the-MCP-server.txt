@@ -1,0 +1,59 @@
+SCAFFOLD AND IMPLEMENT THE MCP SERVER: WHERE AND HOW TO RUN `kagent mcp init`
+==============================================================================
+Project: Deploy a Finance Agent on Kubernetes (Step 4)
+kagent CLI version: 0.10.2
+
+
+THE COMMAND
+-----------
+Run it from the PROJECT folder, finance_agent/ (the one with kagent.yaml):
+
+    cd ~/Projects/k8s-projects/Deploy-a-Finance-Agent-on-Kubernetes/finance_agent
+    kagent mcp init python finnhub-tools --no-git
+
+Don't use the shorter form `kagent mcp init finnhub-tools`. See "Why the
+command changed" below.
+
+
+WHAT IT CREATES (tested on a copy of the project)
+-------------------------------------------------
+finance_agent/                <- run the command here
+|-- kagent.yaml, docker-compose.yaml, .env
+|-- finance_agent/            <- agent code
+`-- finnhub-tools/            <- new MCP server project
+    |-- src/main.py
+    |-- src/tools/echo.py     <- example tool; we'll add the Finnhub tools here
+    |-- manifest.yaml, Dockerfile, pyproject.toml
+    `-- .env.example
+
+
+WHY THE COMMAND CHANGED
+-----------------------
+1. `python` is required.
+   In kagent 0.10.2, `kagent mcp init` needs a language before the name:
+   go, java, python, or typescript. Our server is Python.
+
+2. `--no-git` stops a repo inside your repo.
+   Without it, kagent runs `git init` inside finnhub-tools/ (confirmed in
+   the test). Your repo would then treat that folder as a separate
+   embedded repository, and its files wouldn't be committed with the rest
+   of your project.
+
+3. Why the project folder.
+   The docker-compose.yaml that kagent generates looks for the server at
+   ./finnhub-tools, relative to the project folder (finance_agent/).
+   Running the command anywhere else breaks that path.
+
+
+GOOD TO KNOW
+------------
+- `kagent mcp init` only creates the server's files. It doesn't connect
+  the server to your agent and doesn't touch kagent.yaml (confirmed in the
+  test). `kagent add-mcp` does that later in Step 4.
+- The generated finnhub-tools service in docker-compose.yaml gets no
+  environment variables, even with `kagent add-mcp --env FINNHUB_API_KEY=...`
+  (tested earlier). We'll need a way to give the server FINNHUB_API_KEY
+  when we wire it up.
+- Other useful flags: --description, --author, --email,
+  --non-interactive (skips the prompts), --force (overwrites an existing
+  folder).

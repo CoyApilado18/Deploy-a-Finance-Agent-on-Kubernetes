@@ -1,8 +1,8 @@
 {
   "name": "finance_agent",
-  "description": "A finance_agent agent",
+  "description": "A finance research agent that fetches real-time stock data and provides market analysis.",
   "url": "localhost:8080",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "capabilities": {
     "streaming": true
   },
@@ -10,10 +10,10 @@
   "defaultOutputModes": ["text"],
   "skills": [
     {
-      "id": "finance_agent",
-      "name": "finance_agent",
-      "description": "A finance_agent agent",
-      "tags": ["finance_agent"]
+      "id": "stock_research",
+      "name": "Stock Research",
+      "description": "Looks up stock quotes, company profiles, and analyst trends, then explains what the numbers mean.",
+      "tags": ["finance", "stocks", "market-data"]
     }
   ]
 }

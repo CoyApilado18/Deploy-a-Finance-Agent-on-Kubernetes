@@ -1,0 +1,404 @@
+KAGENT DEPLOY FIX: Deploy a Finance Agent on Kubernetes
+========================================================
+Date: 2026-10-10 / 2026-10-11
+kagent CLI version: 0.10.2
+Cluster controllers: kagent controller 0.10.2, kmcp controller 0.3.0
+Cluster: kubeadm, 2 nodes (controlplane 192.168.1.107, node01 192.168.1.225),
+         containerd runtime, context kubernetes-admin@kubernetes
+Scope: Step 4/5, "kagent deploy . --env-file .env"
+
+Result: three files fixed. A dry-run of the deploy now produces correct
+manifests for both the agent and the finnhub-tools MCP server. Nothing has
+been built, pushed or deployed by me. The commands to do that are in
+"WHAT YOU RUN NEXT" at the bottom. All changes are uncommitted.
+
+
+-------------------------------------------------------------------------
+OVERVIEW
+-------------------------------------------------------------------------
+Problem                                          Where                     Status
+-----------------------------------------------  ------------------------  -------------
+Push to localhost:5001 refused                   kagent deploy (default)   Fixed (--image)
+MCP server entry ignored / wrong image           kagent.yaml               Fixed
+MCP server would never start (no command)        kagent.yaml               Fixed
+HTTP env vars break the stdio MCP server         kagent.yaml               Fixed (removed)
+Agent had no MCP tools (empty server list)       finance_agent/mcp_tools.py Fixed
+Finnhub key arrives under a lowercase name       finnhub-tools/src/tools/  Fixed
+                                                 tools.py
+${FINNHUB_API_KEY} read from shell, not .env     kagent deploy behaviour   Workaround
+                                                                           (source .env)
+agentName: hyphen vs underscore conflict         kagent.yaml               Kept finance-agent
+                                                                           (explained below)
+
+
+-------------------------------------------------------------------------
+THE ORIGINAL ERROR
+-------------------------------------------------------------------------
+Command (from finance_agent/):
+    kagent deploy . --env-file .env
+
+Output (end):
+    naming to localhost:5001/finance-agent:latest done
+    Successfully built Docker image: localhost:5001/finance-agent:latest
+    The push refers to repository [localhost:5001/finance-agent]
+    failed to do request: Head "https://localhost:5001/v2/finance-agent/blobs/...":
+      dial tcp 127.0.0.1:5001: connect: connection refused
+    Error: failed to build Docker image: failed to push Docker image:
+      docker push failed: exit status 1
+
+The build worked. The PUSH failed, so nothing was created in the cluster.
+
+
+-------------------------------------------------------------------------
+FIX 1: push to Docker Hub instead of localhost:5001
+-------------------------------------------------------------------------
+WHAT WAS WRONG
+  Without --image, kagent deploy names the agent image
+      localhost:5001/{agentName}:latest
+  and pushes it there. localhost:5001 is the local registry that a "kind"
+  cluster creates. This machine has no kind and nothing listening on
+  port 5001, so the push was refused.
+
+  Starting a registry on port 5001 would not help either. This is a real
+  2-node kubeadm cluster. Each node would look for "localhost:5001" on
+  ITSELF, so node01 could never pull the image.
+
+  An image that is only built locally is also not enough. It lives in
+  Docker on this machine. The nodes run containerd and pull from a
+  registry, so they can't see local Docker images.
+
+WHAT I DID
+  Nothing to edit. Pass --image so the agent image goes to Docker Hub,
+  which both nodes can reach (you are already logged in as testyoc):
+      kagent deploy . --env-file .env --image docker.io/testyoc/finance-agent:v2
+
+  A NEW tag (v2) is used on purpose. The testyoc/finance-agent:v1 you
+  pushed earlier contains the empty mcp_tools.py (see Fix 4). A new tag
+  guarantees the nodes don't run a cached copy of the old image.
+
+
+-------------------------------------------------------------------------
+HOW KAGENT.YAML BECOMES TWO PODS (background)
+-------------------------------------------------------------------------
+kagent.yaml describes two separate things:
+
+  Top section (agentName, modelProvider, ...)  -> the AGENT
+      Always built by kagent deploy from ./Dockerfile.
+      Image name = --image, or localhost:5001/{agentName}:latest.
+      Becomes an Agent resource -> pod 1.
+
+  mcpServers list                              -> the TOOL SERVERS
+      Each entry gets its container in one of three ways:
+        build: <folder>  kagent builds it, ALWAYS named
+                         localhost:5001/{agentName}-{mcpName}:latest
+                         (cannot be changed -> same push failure as above)
+        image: <ref>     kagent builds NOTHING, uses the image as-is
+        remote + url     nothing runs; agent just connects to the URL
+      Becomes an MCPServer resource -> pod 2.
+
+  A "command:" entry with NO image and NO build only works for servers
+  published on PyPI/npm (e.g. uvx mcp-server-fetch). Our Finnhub code is
+  only in the local finnhub-tools/ folder, so it MUST be in an image.
+
+Because "build:" always pushes to localhost:5001, we use "image:". You
+build and push the finnhub-tools image yourself, and kagent deploy only
+builds and pushes the agent image.
+
+  Image                                Built + pushed by
+  -----------------------------------  -----------------------------
+  docker.io/testyoc/finnhub-tools:v2   you (docker build / docker push)
+  docker.io/testyoc/finance-agent:v2   kagent deploy (because of --image)
+
+The two pods find each other by NAME. The agent's mcp_tools.py connects to
+    http://finnhub-tools:3000/mcp
+which is the Kubernetes Service that the MCPServer "finnhub-tools" creates
+in the kagent namespace.
+
+
+-------------------------------------------------------------------------
+FIX 2: kagent.yaml mcpServers entry
+-------------------------------------------------------------------------
+File: finance_agent/kagent.yaml
+
+HISTORY OF THE ENTRY
+  a) mcp_servers: + image: testyoc/finance-agent:v2
+       - "mcp_servers" is not a key kagent reads. I checked the YAML tags
+         in the kagent 0.10.2 binary; the key is "mcpServers". The whole
+         block was silently ignored.
+       - It had no "type".
+       - The image was the AGENT image, not the tool server.
+  b) mcpServers: + command: python, args: ["-m", "finnhub_tools"]
+       - No image -> the code is never in any container.
+       - There is no module "finnhub_tools"; the server starts with
+         "python src/main.py".
+  c) (my earlier advice, written by kagent add-mcp)
+       image: testyoc/finnhub-tools:v1 + env MCP_TRANSPORT_MODE=http,
+       HOST=0.0.0.0, PORT=3000
+       - WRONG. See "how the MCP pod runs" below.
+
+HOW THE MCP POD ACTUALLY RUNS (verified)
+  A dry-run showed kagent creates the MCPServer with
+      transportType: stdio
+  I read the kmcp v0.3.0 controller source
+  (pkg/controller/transportadapter/transportadapter_translator.go):
+    - An init container copies the "agentgateway" binary into the pod.
+    - The main container's command is REPLACED with
+          /adapterbin/agentgateway -f /config/local.yaml
+      so the image's own CMD (python src/main.py) is NOT used.
+    - agentgateway listens on port 3000 (HTTP, /mcp) and starts the MCP
+      server as a child process using spec.deployment.cmd + args, talking
+      to it over stdin/stdout (stdio).
+    - Secrets in secretRefs are loaded with envFrom (environment
+      variables named after the secret's keys). The CRD description says
+      "mounted as volumes", but the code uses envFrom.
+
+  Consequences:
+    - With MCP_TRANSPORT_MODE=http our server would start its own HTTP
+      server on port 3000. That port clashes with agentgateway, and the
+      server never answers on stdio. These env vars had to go. stdio is
+      the server's default, so nothing replaces them.
+    - With no "command", agentgateway has nothing to start (cmd empty).
+      "command: python" + "args: [src/main.py]" are required. The child
+      process inherits the container's working directory (/app) and PATH
+      (/app/.venv/bin first), so "python src/main.py" runs the server
+      with its virtualenv.
+
+WHAT I DID
+  Replaced the mcpServers entry with:
+      mcpServers:
+          - type: command
+            name: finnhub-tools
+            image: docker.io/testyoc/finnhub-tools:v2
+            command: python
+            args:
+              - src/main.py
+            env:
+              - FINNHUB_API_KEY=${FINNHUB_API_KEY}
+
+  - image tag v2: the image must be rebuilt because of Fix 3. v1 on
+    Docker Hub has the old tools.py.
+  - The ${FINNHUB_API_KEY} reference makes kagent put the key in a
+    Kubernetes Secret (finnhub-tools-env), never in plain text. Do NOT
+    paste the real key here; kagent.yaml is committed to git.
+  - updatedAt and the top section were left unchanged.
+
+
+-------------------------------------------------------------------------
+FIX 3: Finnhub API key name in tools.py
+-------------------------------------------------------------------------
+File: finance_agent/finnhub-tools/src/tools/tools.py
+
+WHAT WAS WRONG
+  kagent deploy stores the MCP server's env-var secrets under a
+  LOWERCASED key (its sanitizeForSecretKey step). The dry-run shows:
+      kind: Secret / name: finnhub-tools-env
+      data:
+        finnhub_api_key: <base64>
+  kmcp loads that secret with envFrom, so inside the pod the variable is
+  "finnhub_api_key", not "FINNHUB_API_KEY". Linux environment variables
+  are case-sensitive.
+
+  The original code read only FINNHUB_API_KEY, so it would have got an
+  empty key in the cluster and every Finnhub call would have returned
+  401. At the time of this fix the file had been changed to read ONLY
+  "finnhub_api_key", which works in the cluster but breaks local runs
+  where the key is exported as FINNHUB_API_KEY.
+
+WHAT I DID
+  Read either name, uppercase first:
+      # kagent deploy stores this key under the lowercase name "finnhub_api_key" in the
+      # MCP server's secret; locally it is usually exported as FINNHUB_API_KEY.
+      FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY") or os.environ.get("finnhub_api_key", "")
+
+VERIFIED
+  Ran the same expression with three environments:
+      only FINNHUB_API_KEY=U   -> 'U'
+      only finnhub_api_key=L   -> 'L'
+      neither                  -> ''
+  File parses (python ast).
+
+DO NOT CHANGE .env
+  .env keeps FINNHUB_API_KEY in uppercase. The lowercasing is done by
+  kagent, and ${FINNHUB_API_KEY} must match the uppercase name.
+
+
+-------------------------------------------------------------------------
+FIX 4: finance_agent/mcp_tools.py was empty
+-------------------------------------------------------------------------
+File: finance_agent/finance_agent/mcp_tools.py
+
+WHAT WAS WRONG
+  The agent builds its tool connections from _MCP_SERVERS in this file.
+  It was still:
+      _MCP_SERVERS = [
+      ]
+  so the agent would deploy with NO tools, even with a perfect MCP pod.
+
+  Normally "kagent add-mcp" regenerates this file. It didn't, because of
+  the agentName (Fix 5): kagent writes the file into a folder named after
+  agentName ("finance-agent/"), which doesn't exist. Our package folder
+  is "finance_agent/". kagent deploy does not regenerate it either.
+
+  To get the exact content, I ran kagent init + kagent add-mcp in a
+  throwaway scratchpad project with agentName finance_agent. There it
+  generated:
+      _MCP_SERVERS = [
+          {
+              "name": "finnhub-tools",
+              "type": "command",
+          },
+      ]
+
+WHAT I DID
+  Added that same entry by hand. The file's header says "AUTOGENERATED,
+  DO NOT EDIT"; this is the content kagent itself generates.
+
+VERIFIED
+  Imported the module with the project .venv:
+      get_mcp_tools() -> 1 toolset -> http://finnhub-tools:3000/mcp
+  For "command" servers the URL is http://{name}:3000/mcp, which matches
+  the MCPServer's Service name and agentgateway's port.
+
+CAVEAT
+  If kagent ever regenerates this file, re-check that the entry is still
+  there.
+
+
+-------------------------------------------------------------------------
+FIX 5 (decision): agentName stays "finance-agent"
+-------------------------------------------------------------------------
+File: finance_agent/kagent.yaml (unchanged)
+
+THE CONFLICT IN KAGENT 0.10.2
+  - kagent init rejects hyphens (tested in the scratchpad):
+        invalid agent name "finance-agent": character '-' at position 7
+        is not allowed. Agent names must only contain letters, digits,
+        and underscores
+  - kagent deploy uses agentName as the Kubernetes resource name. A
+    dry-run with "finance_agent" produced
+        Secret "finance_agent-env" and Agent "finance_agent"
+    Kubernetes rejects underscores in those names (RFC 1123), so the
+    real deploy would fail.
+
+WHY "finance-agent" IS SAFE FOR DEPLOY
+  - kagent deploy does not check the name (the original deploy got all
+    the way to the push).
+  - The Agent resource (BYO) only sets the image and env. It does not
+    override the container command, so the pod runs the Dockerfile's
+        CMD ["finance_agent"]
+    and still loads the Python package folder finance_agent/.
+  - Resources become: Agent "finance-agent", Secret "finance-agent-env".
+    Both are valid.
+
+COST OF THE HYPHEN
+  - kagent add-mcp can't regenerate mcp_tools.py (Fix 4).
+  - Local "kagent run" is broken: the regenerated docker-compose.yaml
+    starts command ["finance-agent", "--local"], which is not the package
+    name. This doesn't affect the cluster deploy. Fix it separately if
+    you need local runs again.
+
+
+-------------------------------------------------------------------------
+WORKAROUND: ${FINNHUB_API_KEY} comes from the SHELL, not .env
+-------------------------------------------------------------------------
+--env-file .env only feeds the AGENT's secret (finance-agent-env). The
+${FINNHUB_API_KEY} reference in mcpServers.env is resolved from the
+environment of the terminal running kagent deploy. A dry-run with the key
+only in .env failed with:
+    Error: failed to deploy MCP servers: failed to deploy command MCP
+    server 'finnhub-tools': failed to create secrets for env vars:
+    environment variable 'FINNHUB_API_KEY' referenced in env var
+    'FINNHUB_API_KEY' is not set
+
+Fix: load .env into the shell first (reads the file, doesn't change it):
+    set -a; source .env; set +a
+set -a exports every variable the file defines; set +a turns that off.
+It only lasts for that terminal, so run it in the same terminal as
+kagent deploy.
+
+
+-------------------------------------------------------------------------
+VERIFICATION OF THE FINAL SETUP (dry-run, nothing applied)
+-------------------------------------------------------------------------
+Ran from finance_agent/:
+    set -a; . ./.env; set +a
+    kagent deploy . --env-file .env --image docker.io/testyoc/finance-agent:v2 --dry-run
+Exit code 0. --dry-run doesn't build, push or apply. Output (keys hidden):
+
+  Secret    finance-agent-env  (FINNHUB_API_KEY, GOOGLE_API_KEY)
+  Agent     finance-agent      type BYO
+            image docker.io/testyoc/finance-agent:v2
+            env GOOGLE_API_KEY, FINNHUB_API_KEY from finance-agent-env
+  Secret    finnhub-tools-env  (finnhub_api_key)
+  MCPServer finnhub-tools      transportType stdio, port 3000
+            image docker.io/testyoc/finnhub-tools:v2
+            cmd python, args [src/main.py]
+            secretRefs finnhub-tools-env
+
+The dry-run output contains the real API keys in base64. I only kept it
+in the session scratchpad and deleted it. Don't save dry-run output
+inside the repo.
+
+Other checks done:
+  - docker.io/testyoc/finnhub-tools:v1 exists on Docker Hub (amd64,
+    CMD python src/main.py, user mcpuser). Superseded by v2 (Fix 3).
+  - docker.io/testyoc/finance-agent:v1 exists on Docker Hub (amd64).
+    Superseded by v2 (Fix 1 / Fix 4).
+  - finnhub-tools/Dockerfile reviewed: builder stage installs from
+    uv.lock, runtime stage python:3.12-slim with /app/.venv on PATH,
+    non-root user. OK. EXPOSE 8080 and HEALTHCHECK are ignored by
+    Kubernetes. httpx (used by tools.py) is not in pyproject.toml but is
+    installed as a dependency of fastmcp (present in uv.lock).
+  - Cluster has the CRDs agents.kagent.dev and mcpservers.kagent.dev.
+
+NOT TESTED
+  - Building/pushing finnhub-tools:v2 and finance-agent:v2.
+  - The real deploy and the pods actually running.
+  - A real Finnhub call through agentgateway inside the cluster.
+
+
+-------------------------------------------------------------------------
+FILES CHANGED
+-------------------------------------------------------------------------
+  finance_agent/kagent.yaml                    mcpServers entry (Fix 2)
+  finance_agent/finnhub-tools/src/tools/tools.py   key lookup (Fix 3)
+  finance_agent/finance_agent/mcp_tools.py     _MCP_SERVERS entry (Fix 4)
+  kagent-deploy.txt                            this document
+
+NOT changed: .env, Dockerfile, agent.py, agent-card.json,
+finnhub-tools/Dockerfile.
+
+Created by kagent add-mcp earlier (not by me):
+  finance_agent/finnhub-tools/config.yaml  (agentgateway config for local
+  kagent run). It still lists the old HTTP env vars and an empty cmd.
+  It's only used by local "kagent run", not by the cluster deploy.
+
+
+-------------------------------------------------------------------------
+WHAT YOU RUN NEXT (from finance_agent/)
+-------------------------------------------------------------------------
+1. Build and push the MCP server image with the tools.py fix:
+       docker build -t docker.io/testyoc/finnhub-tools:v2 finnhub-tools
+       docker push docker.io/testyoc/finnhub-tools:v2
+
+2. Load the keys into this terminal:
+       set -a; source .env; set +a
+
+3. Preview (nothing applied):
+       kagent deploy . --env-file .env --image docker.io/testyoc/finance-agent:v2 --dry-run > /dev/null && echo OK
+
+4. Deploy (builds + pushes the agent image, creates both resources):
+       kagent deploy . --env-file .env --image docker.io/testyoc/finance-agent:v2
+
+5. Check:
+       kubectl get agents,mcpservers -n kagent
+       kubectl get pods -n kagent | grep -E 'finance-agent|finnhub-tools'
+       kubectl logs -n kagent deploy/finnhub-tools
+       kubectl logs -n kagent deploy/finance-agent
+
+   Then ask the agent "What is the current price of AAPL?" (kagent
+   dashboard or kagent invoke) and confirm it returns a real price.
+
+Note: if the Docker Hub repos testyoc/finance-agent and
+testyoc/finnhub-tools are public, anyone can pull the images. They
+contain code only; the API keys live in Kubernetes Secrets.

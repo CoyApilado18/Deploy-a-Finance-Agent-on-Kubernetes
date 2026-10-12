@@ -1,7 +1,16 @@
-agentName: finance_agent
+agentName: finance-agent
 language: python
 framework: adk
 modelProvider: gemini
 modelName: gemini-3.6-flash
-description: ""
-updatedAt: 2026-09-29T04:41:37.785432594-05:00
+description: A finance research agent that fetches real-time stock data and provides market analysis.
+mcpServers:
+    - type: command
+      name: finnhub-tools
+      image: docker.io/testyoc/finnhub-tools:v2
+      command: python
+      args:
+        - src/main.py
+      env:
+        - FINNHUB_API_KEY=${FINNHUB_API_KEY}
+updatedAt: 2026-10-10T12:56:46.458952326-05:00

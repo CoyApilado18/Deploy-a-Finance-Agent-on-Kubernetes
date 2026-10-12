@@ -1,0 +1,245 @@
+FINANCE AGENT GAVE NO LIVE DATA IN THE KAGENT DASHBOARD
+=======================================================
+Date: 2026-10-12
+Components: kagent 0.10.2 (kagent-adk runtime, google-adk inside it),
+            kmcp controller 0.3.0 (agentgateway stdio adapter),
+            finnhub-tools MCP server (FastMCP 3.0.0, Python 3.12)
+Related docs: kagent-deploy.txt (deploy setup), cali-migration.txt (DNS fix)
+
+Result: FIXED. The agent now gets its tools reliably. Three test questions
+        (one per Finnhub tool) all completed with live data, and the agent
+        logged 0 MCP connection errors.
+
+
+-------------------------------------------------------------------------
+SYMPTOM
+-------------------------------------------------------------------------
+In the kagent dashboard (kagent dashboard -> http://localhost:8082), a
+conversation with kagent/finance-agent asking for Apple's current stock
+price got this answer:
+
+    Summary
+    I currently do not have access to a real-time stock market data tool or
+    live market feed to fetch the exact, up-to-the-second stock price for
+    Apple Inc. (AAPL).
+
+But a little earlier, the same question through the CLI worked:
+    kagent invoke -a finance-agent -t "What is the current price of AAPL? Use your tools."
+    -> completed, tool get_stock_quote, AAPL $340.76 ...
+
+So the setup was right, but the tools were only available SOME of the time.
+
+
+-------------------------------------------------------------------------
+INVESTIGATION
+-------------------------------------------------------------------------
+1. Both pods were healthy
+     finance-agent  (v2)  Running, 0 restarts
+     finnhub-tools  (v2)  Running, 0 restarts
+   DNS and the network were fine (fixed earlier, see cali-migration.txt).
+
+2. Agent log at the time of the dashboard question (15:50, pod IP
+   10.244.49.72):
+     15:50:28  request from the dashboard; session created
+     15:50:33  WARNING mcp_tool.session_context - Error on session runner task:
+                 unhandled errors in a TaskGroup (1 sub-exception)
+     15:50:33  INFO  Retrying get_tools due to error: Failed to create MCP
+                 session: ...
+     15:50:38  WARNING (same error again)
+     15:50:38  WARNING llm_agent - Failed to get tools from toolset MCPToolset:
+                 Failed to create MCP session ...
+     15:50:38  Sending out request, model: gemini-3.6-flash   <- WITHOUT tools
+     15:50:49  Response received from the model.
+   The two failures are exactly 5 seconds apart (28 -> 33 -> 38).
+   After the retry failed, ADK sent the question to Gemini with an EMPTY
+   tool list. Gemini then honestly said it has no live-data tool, which is
+   what the system prompt tells it to do ("If you don't have a tool for
+   something, say so clearly rather than guessing").
+
+3. finnhub-tools log at the same time (same pod, agentgateway + server):
+     15:50:32.95  Loaded tool module: echo / tools
+     15:50:33.24  request from 10.244.49.72 ...           <- agent attempt 1
+     15:50:33     Starting MCP server 'finnhub-tools' with transport 'stdio'
+     15:50:38.07  Loaded tool module: echo / tools
+     15:50:38.32  request from 10.244.49.72 ...           <- agent attempt 2
+     15:50:38     Starting MCP server ...
+   Each attempt started a NEW Python process. Each was ready about 5 s
+   after the agent connected, just after the agent had already given up.
+
+4. Every MCP session spawns a fresh server process
+   The other client in the logs is the kagent controller (10.244.49.70),
+   which checks the MCP server about every 65 s. Each of its sessions
+   showed the same pattern: "Loaded tool module" -> "Starting MCP server"
+   -> first POST answered after:
+     15:48:14  4773 ms
+     15:49:20  5099 ms
+     15:50:25  5028 ms
+     15:51:31  5086 ms
+     16:02:25  4929 ms
+     16:03:29  4469 ms
+     16:04:35  4608 ms
+     16:05:39  3665 ms
+     16:06:44  4344 ms
+     16:07:49  4409 ms
+   Right after the first deploy, the first sessions took 19558 ms and
+   12336 ms (cold container, empty file caches).
+   Resources: the finnhub-tools container has NO CPU/memory limits
+   (resources: {}), so this isn't throttling. It's simply how long Python
+   takes to import FastMCP 3.0 and its dependencies (authlib, pydantic,
+   httpx, ...), load src/tools/*.py, and start the server.
+
+5. The client's timeout
+   Read inside the running agent pod:
+     google.adk.tools.mcp_tool.mcp_session_manager.StreamableHTTPConnectionParams
+       timeout          = 5.0     <- HTTP connect/initialize timeout (s)
+       sse_read_timeout = 300.0
+   finance_agent/mcp_tools.py created the connection with only the URL:
+       StreamableHTTPConnectionParams(url=url)
+   so the 5 s default applied.
+
+
+-------------------------------------------------------------------------
+ROOT CAUSE
+-------------------------------------------------------------------------
+A race between two numbers that are almost the same:
+
+    server cold start per MCP session   ~3.7 - 5.1 s (up to ~20 s when cold)
+    agent's MCP connect timeout          5.0 s
+
+How the pieces fit:
+  - kagent deploys a "type: command" MCP server as an MCPServer with
+    transportType: stdio. The pod runs agentgateway on port 3000 (HTTP,
+    /mcp). For EVERY new MCP session, agentgateway starts the configured
+    command (python src/main.py) and talks to it over stdin/stdout.
+  - The agent (google-adk) opens a new MCP session when it handles a
+    request (here: one per dashboard message; it closes the toolset when
+    the runner closes). So every question pays the full server start time.
+  - If the server takes longer than 5.0 s to answer the MCP "initialize"
+    request, the client gives up, retries once, and if that also takes over
+    5 s, continues WITHOUT tools.
+
+Why the CLI test worked and the dashboard didn't: luck. The server
+happened to start in under 5 s for the kagent invoke request, and just
+over 5 s for both attempts from the dashboard. It wasn't a dashboard
+vs. CLI difference. Both use the same A2A endpoint and the same code path.
+
+
+-------------------------------------------------------------------------
+FIX
+-------------------------------------------------------------------------
+File: finance_agent/finance_agent/mcp_tools.py
+
+Give the MCP connection a 30-second connect timeout instead of the 5 s
+default:
+
+    # The finnhub-tools server is started fresh (stdio) for every MCP session and
+    # takes ~4-5 s to boot, which is right at ADK's 5 s default connect timeout.
+    _MCP_CONNECT_TIMEOUT = 30.0
+    ...
+        if headers:
+            connection_params = StreamableHTTPConnectionParams(url=url, headers=headers, timeout=_MCP_CONNECT_TIMEOUT)
+        else:
+            connection_params = StreamableHTTPConnectionParams(url=url, timeout=_MCP_CONNECT_TIMEOUT)
+
+Why 30 s: comfortably above the worst start time seen (~20 s right after
+a fresh deploy), but still short enough that a really dead server fails
+in reasonable time.
+
+Is editing this file OK? Its header says "AUTOGENERATED, DO NOT EDIT".
+kagent regenerates it only through "kagent add-mcp", and with
+agentName "finance-agent" (hyphen) it never does (see kagent-deploy.txt,
+Fix 4/5). So this edit stays. If the file is ever regenerated, re-apply
+the timeout.
+
+Trade-off: when the server is slow to start, the agent now WAITS for it
+(about 5 s, sometimes more) instead of answering without tools. Answers
+take a bit longer but contain live data.
+
+Verified locally before deploying:
+    get_mcp_tools()[0]._connection_params -> http://finnhub-tools:3000/mcp timeout= 30.0
+
+
+-------------------------------------------------------------------------
+DEPLOY
+-------------------------------------------------------------------------
+From finance_agent/:
+    set -a; . ./.env; set +a
+    kagent deploy . --env-file .env --image docker.io/testyoc/finance-agent:v3
+
+  - New tag v3 (previous: v2), so the nodes can't run a cached old image.
+  - Pushed: docker.io/testyoc/finance-agent:v3
+            digest sha256:2e2718709ff6cbfb8da24d2324d2c929d3803d02d9bda56168c2f780e027bdac
+  - "deployment.apps/finance-agent restarted ... successfully rolled out"
+  - finnhub-tools was NOT changed (still v2).
+
+After the rollout:
+    finance-agent-5697d995d9-8sks4  Running  docker.io/testyoc/finance-agent:v3  0 restarts
+    agent finance-agent             BYO  READY True  ACCEPTED True
+    (the old v2 pod terminated normally)
+
+
+-------------------------------------------------------------------------
+VERIFICATION
+-------------------------------------------------------------------------
+Three questions, one per Finnhub tool, via kagent invoke:
+
+  Question                                       State      Tools called                           Time
+  ---------------------------------------------  ---------  -------------------------------------  ----
+  What is the current price of AAPL?             completed  get_stock_quote                         18 s
+  Give me the company profile for MSFT.          completed  get_company_profile, get_stock_quote    13 s
+  What do analysts recommend for NVDA?           completed  get_recommendation_trends,              17 s
+                                                            get_stock_quote
+
+  Sample answers:
+    "Apple Inc. (AAPL) is currently trading at $340.39, up $3.75 (+1.11%)"
+    "Below is the company profile and real-time stock overview for
+     Microsoft Corp (NASDAQ: MSFT) ..."
+    "Wall Street analysts are overwhelmingly bullish on NVIDIA Corporation
+     (NVDA), with approximately 94% of covering analysts issuing a 'Buy' or
+     'Strong Buy' recommendation."
+
+MCP session start times for the NEW agent pod (10.244.196.146), from the
+finnhub-tools log, first POST (initialize) of each session:
+    4759 ms, 5232 ms, 9677 ms
+Two of the three were OVER the old 5 s limit. Before the fix they would
+have failed and the agent would have answered without tools. Now they
+succeeded. (The other POSTs, 15-455 ms, are follow-up calls on sessions
+that were already open.)
+
+Agent log since v3 started: 0 lines matching
+    "Failed to get tools" / "Retrying get_tools" / "Error on session runner"
+
+All three Finnhub tools (get_stock_quote, get_company_profile,
+get_recommendation_trends) are confirmed working in the cluster.
+
+
+-------------------------------------------------------------------------
+HOW TO TEST IN THE DASHBOARD
+-------------------------------------------------------------------------
+  kagent dashboard        (port-forward, then open http://localhost:8082)
+  -> kagent/finance-agent -> start a NEW conversation
+  -> "What is the current price of AAPL?"
+
+Use a NEW conversation. The old one's history already contains the "I
+don't have a live data tool" answer, and the model may repeat itself
+based on that history.
+
+If it ever happens again, check:
+    kubectl logs -n kagent deploy/finance-agent | grep -E 'Failed to get tools|Retrying get_tools'
+    kubectl logs -n kagent deploy/finnhub-tools --since=10m | grep -E 'Starting MCP server|duration='
+
+
+-------------------------------------------------------------------------
+OPTIONAL IMPROVEMENTS (not done)
+-------------------------------------------------------------------------
+  - Faster server start: remove the example echo tool
+    (finnhub-tools/src/tools/echo.py), trim unused imports. This only
+    trims a little. Most of the time is FastMCP's own import. It won't
+    reliably get under 5 s, so keep the timeout.
+  - Avoid per-session process start: run the server as a long-lived HTTP
+    server (MCPServer transportType: http with httpTransport.targetPort),
+    so only the first request pays the start-up cost. kagent's
+    "type: command" entry always generates stdio, so this would need a
+    hand-written MCPServer manifest instead of the kagent.yaml entry.
+  - Upgrade notice in the server log: FastMCP 4.1.0 is available (we use
+    3.0.0). Not related to this issue.
