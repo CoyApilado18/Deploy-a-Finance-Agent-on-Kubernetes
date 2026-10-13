@@ -15,7 +15,7 @@ By the end of this project, we'll have:
 • A fully declarative deployment defined in YAML, with your agent and tool server running as proper Kubernetes workloads with secrets managed securely.  
 • Extra Credit: Add a company news analysis tool that lets your agent fetch and summarize the latest headlines for any stock ticker.  
 
-Please note that I'm using my Ubuntu24 machine running in Oracle Virtual Box for this project and I already have an existing Kubernetes cluster deployed using kubeadm with 1 controlplane node and 1 worker node. I'll use my existing Kubernetes cluster instead of Minikube for this project. If you want to install and build your own local Kubernetes cluster using kubeadm from scratch with min specifications inside Oracle Virtual Box, checkout my github repo: [Build-your-local-Kubernetes-cluster](https://github.com/CoyApilado18/Build-your-local-Kubernetes-cluster) Otherwise, follow the steps to install `Minikube` below if you want to launch a Kubernetes cluster out of the box. All commands used in this project are Linux commands. I'll update this repo in the future once I tested this out in Windows.  
+We'll deploy our finance-research agent in my local kubeadm Kubernetes cluster with 1 controlplane node and 1 worker node. If you want to install and build your own local Kubernetes cluster with kubeadm from scratch with min specifications inside Oracle Virtual Box, checkout my github repo: [Build-your-local-Kubernetes-cluster](https://github.com/CoyApilado18/Build-your-local-Kubernetes-cluster) 
 
 
 ## Step 1. Install Docker, Minikube, and Python 
@@ -645,7 +645,7 @@ The `--push` flag uploads the built images to the localhost:5001 registry that M
 
 • Update `kagent.yaml` to Link our Docker Hub Images. Since our images live securely in the cloud, we need to tell our cluster to pull them from Docker Hub instead of trying to compile them locally at runtime. We'll need to update our `kagent.yaml` file in VS Code and update the `mcp_servers` section. Replace the `command` and `args` lines with our new Docker Hub image tag:
 ```bash
-agentName: finance_agent
+agentName: finance-agent
 language: python
 framework: adk
 modelProvider: gemini
@@ -672,4 +672,168 @@ This reads our kagent.yaml manifest and creates Kubernetes CRDs for our agent an
 ```bash
 kubectl get agents,mcpservers,pods -n kagent
 ```
-[alt images](k-get-agents-mcpserver-pods.png)
+[alt images](k-get-agents-mcpserver-pods.png)  
+
+
+• I see finance-agent listed as an Agent resource and finnhub-tools listed as an MCPServer resource. Both will show a NAME and AGE column confirming they are registered. I gave it 30 seconds as the kagent controller needs time to reconcile new CRDs after deployment.  
+
+### Chat with yur deployed finance agent  
+Our agent is live on the cluster. Time to talk to it and see real market data flow through the full Kubernetes stack.  
+Open the kagent dashboard by running:  
+```bash
+kagent dashboard
+```
+Output:  
+[alt images](kagent-dashboard.png)  
+
+
+• Our browser opens to http://localhost:8082. Our finance-agent is listed alongside the demo agents.  
+• Click on finance-agent and asked a question "What is Apple's current stock price?" or "Compare AAPL and MSFT for me."  
+
+The dashboard is great for exploration, but the CLI lets us invoke the agent directly from y\our terminal too.  
+
+Before we run the next command, predict: will the agent respond with a real stock price or a generic answer?  
+
+• I'll Invoke the agent from our terminal by running this command:  
+```bash
+kagent invoke --agent finance-agent --task "What is the current stock price of AAPL?" --stream
+```
+Output:
+[alt images](kagent-invoke.png)  
+
+
+I see the agent stream a response that includes a real dollar amount for Apple's stock price, pulled live from Finnhub in a JSON format. The response includes the current price, daily change, and percentage change.  
+
+
+## Extra Credit 
+What good is knowing a stock price if you cannot explain why it moved?  
+
+Right now our agent fetches quotes, company profiles, and analyst recommendations. But when a stock jumps 5% overnight, the agent can only report the number. It cannot tell us why. In this Extra Credit, we will add a company news tool that calls Finnhub's `/api/v1/company-news` endpoint so the agent can fetch recent headlines and provide context alongside price data.  
+
+In this Extra Credit, we'll:  
+• Add a `get_company_news` tool function to your MCP server that calls the Finnhub company news endpoint.  
+• Rebuild the MCP server image and redeploy to our local kubeadm cluster.  
+• Test the agent's new ability to combine price data and news analysis in a single response.  
+
+
+💡 Why does the MCP pattern scale so well?  
+We are about to add an entirely new capability to your agent without touching the agent code itself. The agent's system prompt already says "use your available tools." When you add a new MCP tool to the server, the agent discovers it automatically through the MCP protocol.
+
+This is the power of the pattern: one new function in your tool server gives the agent a new skill. No retraining, no prompt rewriting, no agent redeployment.
+
+
+### Update the imports in your tools file
+The news tool needs to calculate date ranges ("fetch news from the last 7 days"). Python's datetime and timedelta handle this.  
+
+• Open `finnhub-tools/tools.py` in VS Code.  
+• Find the imports at the top of the file:  
+```bash
+import os
+import httpx
+```
+
+### Add the get_company_news tool function  
+This new tool calls Finnhub's company news endpoint with a date range and returns up to 10 recent articles.  
+Scroll to the bottom of tools.py, after the get_recommendation_trends function.  
+Add the function signature, docstring, and date calculation logic:  
+```python
+@mcp.tool()
+async def get_company_news(symbol: str, days: int = 7) -> list:
+    """Get recent company news for a given ticker symbol.
+
+    Args:
+        symbol: The stock ticker symbol (e.g., AAPL, MSFT, GOOGL)
+        days: Number of days of news to fetch (default 7)
+
+    Returns:
+        A list of news articles with headline, summary, source, url, and datetime.
+    """
+    today = datetime.now()
+    from_date = (today - timedelta(days=days)).strftime("%Y-%m-%d")
+    to_date = today.strftime("%Y-%m-%d")
+```
+
+💡 What does this code do?  
+The `days` parameter defaults to 7, giving the agent a week of news by default. The function calculates `from_date` and `to_date` as strings in the `YYYY-MM-DD` format that Finnhub's API expects.  
+
+• Immediately below the date calculation (still inside the same function), add the HTTP call and response processing:  
+```bash
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{FINNHUB_BASE_URL}/company-news",
+            params={
+                "symbol": symbol.upper(),
+                "from": from_date,
+                "to": to_date,
+                "token": FINNHUB_API_KEY,
+            },
+        )
+        response.raise_for_status()
+        articles = response.json()
+        return [
+            {
+                "headline": a.get("headline"),
+                "summary": a.get("summary"),
+                "source": a.get("source"),
+                "url": a.get("url"),
+                "datetime": a.get("datetime"),
+            }
+            for a in articles[:10]
+        ]
+```
+
+💡 What does this code do?  
+This calls Finnhub's `/company-news` endpoint with the symbol, date range, and your API token. The response contains all matching articles, so `articles[:10]` limits the return to the 10 most recent. Each article is trimmed to just the fields the agent needs: headline, summary, source, url, and datetime.  
+
+
+• Save `tools.py`.
+• Test it with the MCP Inspector (browser UI)
+```bash
+npx @modelcontextprotocol/inspector .venv/bin/python src/main.py
+```
+• Open the URL it prints, go to `Tools → get_company_news`, enter a symbol and click `Execute Tool`. It'll return a JSON format with the company profile and that shows it's working.  
+
+• Rebuild and redeploy finnhub-tools mcp server to the cluster.
+```bash
+docker build -t testyoc/finnhub-tools:v3 .
+docker push testyoc/finnhub-tools:v3 
+kagent deploy . --env-file .env --image docker.io/testyoc/finance-agent:v3
+```
+
+• Verify the MCP server pod restarted.:  
+```bash
+kubectl get mcpservers -n kagent
+```
+
+You should see `finnhub-tools` listed with a recent age, confirming the redeployment picked up your changes.
+
+
+### Test the news analysis capability
+Our agent now has four tools. I'll ask a question that forces the agent to combine multiple tool. We can either check it in the terminal by running this command:
+```bash
+kagent invoke --agent finance_agent --task "Compare AAPL and MSFT: get me the latest price and any recent news for both" --stream
+```
+
+Our agent should fetch recent headlines from Finnhub's company news endpoint and provide an analysis of what the news means for the stock. You will see it call the `get_company_news` tool and potentially the `get_stock_quote` tool to pair the news with current price data in a JSON output. 
+
+
+or  
+
+interactively in the ui by running the command `kagent dashboard`
+```bash
+kagent dashboard
+```
+
+You'll see a similar output below. Open a different terminal and run the `kubectl port-forward` command and open a browser the paste http://localhost:8082. 
+```bash
+Dashboard is not available on this platform
+You can easily start the dashboard by running:
+kubectl port-forward -n kagent service/kagent-ui 8082:8080
+and then opening http://localhost:8082 in your browser
+``` 
+
+
+
+
+
+

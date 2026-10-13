@@ -1,0 +1,128 @@
+KUBEADM CLUSTER VS. MINIKUBE
+============================
+Date: 2026-10-12
+Context: Deploying the finance agent (kagent 0.10.2) was much harder on my
+         local kubeadm cluster (1 control-plane + 1 worker, Ubuntu 24 VMs in
+         Oracle VirtualBox, Calico CNI) than it would have been on Minikube.
+         This note explains why.
+Related docs: kagent-deploy.txt, cali-migration.txt,
+              finance-agent-no-live-update.txt
+
+
+-------------------------------------------------------------------------
+SHORT ANSWER
+-------------------------------------------------------------------------
+Both run real Kubernetes. The difference is WHO makes the infrastructure
+decisions:
+
+  - kubeadm only bootstraps a cluster on machines you provide. You choose
+    and install the network plugin (CNI), the pod network range, the image
+    registry, and you own the control-plane configuration.
+  - Minikube is an all-in-one local cluster (inside Docker or a VM) with
+    those decisions already made for you, and with sensible defaults.
+
+About half of the problems in this project came from those kubeadm
+decisions. The other half were kagent rough edges that would have
+appeared on ANY cluster.
+
+
+-------------------------------------------------------------------------
+SIDE-BY-SIDE
+-------------------------------------------------------------------------
+                       kubeadm (my cluster)            Minikube
+  -------------------  ------------------------------  ------------------------------
+  What it is           Tool that bootstraps a real     All-in-one local cluster in a
+                       cluster on machines you give    container or VM
+                       it
+  Nodes                Real/VM machines, often many    Usually 1, inside Docker/VM
+  Networking (CNI)     You install it (Calico) and     Preconfigured; doesn't collide
+                       pick the pod CIDR               with your LAN
+  Images               Every node pulls from a         Can build/load straight into
+                       registry (Docker Hub)           the node (minikube image load,
+                                                       eval $(minikube docker-env))
+  Control plane        Static pods you maintain        Managed for you
+                       (/etc/kubernetes/manifests,
+                       kubeadm-config ConfigMap)
+  Starting over        kubeadm reset, re-init, rejoin  minikube delete &&
+                       nodes, reinstall the CNI        minikube start
+  Root/sudo            Needed on nodes for control-    Rarely
+                       plane changes
+  Close to production  High                            Lower (single node, shortcuts)
+
+
+-------------------------------------------------------------------------
+PROBLEMS THAT CAME FROM USING KUBEADM
+-------------------------------------------------------------------------
+(Minikube would have avoided these.)
+
+1. Calico pod CIDR overlapped my home LAN
+   The Calico IPPool was 192.168.0.0/16 (the value from many kubeadm +
+   Calico tutorials). My router/LAN is 192.168.1.x. Calico does not NAT
+   traffic to destinations inside one of its pools, so pod traffic to the
+   LAN DNS server was never masqueraded and external DNS failed in pods
+   (the MCP server couldn't reach finnhub.io).
+   Fix: migrated the pool to 10.244.0.0/16 -> see cali-migration.txt.
+
+2. kube-controller-manager CrashLoopBackOff after the CIDR change
+   With --allocate-node-cidrs=true it refused to start because the nodes'
+   old podCIDRs (192.168.x.0/24) were outside the new --cluster-cidr.
+   On kubeadm, the static pod manifest and the kubeadm-config ConfigMap
+   are yours to keep consistent.
+   Fix: --allocate-node-cidrs=false in the manifest and in kubeadm-config
+   controllerManager.extraArgs -> see cali-migration.txt.
+
+3. Manual sudo steps on the node
+   kube-proxy config, static pod manifests and kubeadm-config edits had to
+   be done by hand with root access.
+
+4. Images must come from a registry every node can reach
+   Each node's containerd pulls images itself, so a locally built image is
+   invisible to the cluster. Everything went through Docker Hub
+   (docker.io/testyoc/...). On Minikube you can load a local image
+   directly into the node.
+
+
+-------------------------------------------------------------------------
+PROBLEMS THAT WERE NOT CAUSED BY KUBEADM
+-------------------------------------------------------------------------
+(Minikube would have hit these too.)
+
+  - Push to localhost:5001 refused: kagent assumes a local registry on
+    that port, which is the kind setup its quickstart uses. Minikube does
+    not provide it by default either. Fix: --image docker.io/...
+  - kagent.yaml schema: mcp_servers vs mcpServers, missing "type:
+    command", "command" without "image", agentName underscore vs hyphen.
+  - ${FINNHUB_API_KEY} in kagent.yaml is read from the SHELL, not from
+    .env. Fix: set -a; . ./.env; set +a before kagent deploy.
+  - Secret key stored lowercase (finnhub_api_key). Fix in tools.py.
+  - ADK's 5 s MCP connect timeout vs. a 4-10 s MCP server cold start.
+    Fix: 30 s timeout in mcp_tools.py.
+  (All in kagent-deploy.txt and finance-agent-no-live-update.txt.)
+
+
+-------------------------------------------------------------------------
+WHICH ONE TO USE
+-------------------------------------------------------------------------
+  - Building and trying apps like this agent: kind or Minikube.
+    kind is what kagent's own quickstart targets (including the
+    localhost:5001 registry), so "kagent deploy" works without --image.
+    With Minikube: start with defaults, install kagent, and use
+    "minikube image load" or Docker Hub for images.
+  - Learning how Kubernetes really works (CNI, control plane, multiple
+    nodes, upgrades): keep the kubeadm cluster. The Calico and
+    controller-manager problems above are exactly what you face on a real
+    self-managed cluster.
+
+
+-------------------------------------------------------------------------
+TIP FOR THE NEXT KUBEADM CLUSTER
+-------------------------------------------------------------------------
+Pick a pod CIDR that cannot collide with your LAN, and use the SAME value
+in kubeadm and in Calico's IPPool before installing Calico:
+
+    sudo kubeadm init --pod-network-cidr=10.244.0.0/16
+    # Calico (operator install): set
+    #   spec.calicoNetwork.ipPools[0].cidr: 10.244.0.0/16
+    # in custom-resources.yaml before applying it
+
+That alone avoids the biggest problem hit in this project.

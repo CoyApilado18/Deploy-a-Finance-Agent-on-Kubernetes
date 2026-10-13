@@ -7,7 +7,7 @@ description: A finance research agent that fetches real-time stock data and prov
 mcpServers:
     - type: command
       name: finnhub-tools
-      image: docker.io/testyoc/finnhub-tools:v2
+      image: docker.io/testyoc/finnhub-tools:v3
       command: python
       args:
         - src/main.py

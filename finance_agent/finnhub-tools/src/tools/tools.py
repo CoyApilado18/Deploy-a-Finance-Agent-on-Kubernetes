@@ -1,4 +1,6 @@
 import os
+from datetime import datetime, timedelta
+
 import httpx
 # Import the shared FastMCP instance from the core framework
 from core.server import mcp
@@ -70,3 +72,39 @@ async def get_recommendation_trends(symbol: str) -> list:
         )
         response.raise_for_status()
         return response.json()
+@mcp.tool()
+async def get_company_news(symbol: str, days: int = 7) -> list:
+    """Get recent company news for a given ticker symbol.
+
+    Args:
+        symbol: The stock ticker symbol (e.g., AAPL, MSFT, GOOGL)
+        days: Number of days of news to fetch (default 7)
+
+    Returns:
+        A list of news articles with headline, summary, source, url, and datetime.
+    """
+    today = datetime.now()
+    from_date = (today - timedelta(days=days)).strftime("%Y-%m-%d")
+    to_date = today.strftime("%Y-%m-%d")
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{FINNHUB_BASE_URL}/company-news",
+            params={
+                "symbol": symbol.upper(),
+                "from": from_date,
+                "to": to_date,
+                "token": FINNHUB_API_KEY,
+            },
+        )
+        response.raise_for_status()
+        articles = response.json()
+        return [
+            {
+                "headline": a.get("headline"),
+                "summary": a.get("summary"),
+                "source": a.get("source"),
+                "url": a.get("url"),
+                "datetime": a.get("datetime"),
+            }
+            for a in articles[:10]
+        ]
