@@ -68,8 +68,8 @@ helm version
 kubectl cluster-info
 ```
 
-You should see a Helm version number and the Kubernetes control plane address 
-![alt images](helm-kubectl.png)
+You should see a Helm version number and the Kubernetes control plane address  
+![alt images](https://github.com/CoyApilado18/Deploy-a-Finance-Agent-on-Kubernetes/blob/119bae25f040e608215f0b3f8f54cec9d61a56b2/images/helm-kubectl.png)
 
 
 ### Install kagent and deploy it to the cluster
@@ -158,7 +158,7 @@ kagent init adk python finance_agent --model-provider Gemini --model-name gemini
 • `finance_agent` is the project name and directory.  
 • `--model-provider Gemini --model-name gemini-3.6-flash` configures the agent to use Google's Gemini 3.6 Flash model.  
 
-You will see output confirming the project was created, including a file tree and next-step hints.
+You will see output confirming the project was created, including a file tree and next-step hints.  
 ![alt images](kagent-init.png)
 
 
@@ -220,7 +220,7 @@ The imports pull in the `Agent` class from Google's ADK and the `get_mcp_tools()
 mcp_tools = get_mcp_tools()
 
 root_agent = Agent(
-    name="finance_agent",
+    name="finance-agent",
     model="gemini-3.6-flash",
     description="A finance research agent that fetches real-time stock data and provides market analysis.",
     instruction=SYSTEM_PROMPT,
@@ -507,7 +507,7 @@ It may take a few seconds for the connection to establish. If you do not have th
 • Enter `AAPL` in the symbol field and click `Run Tool`.  
 
 You should see real-time JSON data returned with Apple's current stock price, change amount, percent change, daily high, low, open, and previous close.  
-[alt images](test-mcp-server-aapl.png)  
+[alt images](https://github.com/CoyApilado18/Deploy-a-Finance-Agent-on-Kubernetes/blob/119bae25f040e608215f0b3f8f54cec9d61a56b2/images/test-mcp-server-aapl.png)  
 
 
 I'll stop the MCP server by pressing `Ctrl+C` in our terminal. Our first tool works. Now we'll add the remaining two tools to give our agent a fuller picture of any stock.  
@@ -533,7 +533,7 @@ async def get_company_profile(symbol: str) -> dict:
         return response.json()
 ```  
 
-💡 What does get_company_profile do?  
+💡 What does `get_company_profile` do?  
 This tool calls Finnhub's `/stock/profile2` endpoint. It returns information like company name, industry, market capitalization, and exchange listing. Your agent uses this to provide context when comparing stocks.  
 
 
@@ -570,10 +570,15 @@ Our `kagent.yaml` already references the `finnhub-tools` MCP server from the sca
 
 • Open `kagent.yaml` and confirm you see this section under `mcp_servers`:`
 ```bash
-mcp_servers:
-  - name: finnhub-tools
-    command: python
-    args: ["-m", "finnhub_tools"]
+mcpServers:
+    - type: command
+      name: finnhub-tools
+      image: docker.io/testyoc/finnhub-tools:v3
+      command: python
+      args:
+        - src/main.py
+      env:
+        - FINNHUB_API_KEY=${FINNHUB_API_KEY}
 ```
 
 • final `kagent.yaml`:
@@ -585,10 +590,15 @@ modelProvider: gemini
 modelName: gemini-3.6-flash
 description: "A finance research agent that fetches real-time stock data and provides market analysis."
 
-mcp_servers:
-  - name: finnhub-tools
-    command: python
-    args: ["-m", "finnhub_tools"]
+mcpServers:
+    - type: command
+      name: finnhub-tools
+      image: docker.io/testyoc/finnhub-tools:v3
+      command: python
+      args:
+        - src/main.py
+      env:
+        - FINNHUB_API_KEY=${FINNHUB_API_KEY}
 ```
 
 💡 How does wiring work?  
@@ -603,7 +613,7 @@ kagent mcp run
 • In the MCP Inspector, under "Servers - finnhub tools" enable connection by clicking the "Disconnected" button. It will automatically turn on the connection and see the status to "Connected".  
 • Click the `Tools` tab, and you'll see the 3 tools under Tools; `get_stock_quote`, `get_company_profile`, and `get_recommendation_trends`.
 • Select `get_stock_quote`, enter `AAPL` in the symbol field, and click `Execute Tool`. You should see real price data returned as JSON with fields like `current_price`, `change`, and `percent_change`.  
-[alt images](get_stock_quote_json.png)
+[alt images](https://github.com/CoyApilado18/Deploy-a-Finance-Agent-on-Kubernetes/blob/119bae25f040e608215f0b3f8f54cec9d61a56b2/images/get_stock_quote_json.png)
 
 
 ## Step 5. Deploy to Kubernetes and Chat
@@ -672,7 +682,7 @@ This reads our kagent.yaml manifest and creates Kubernetes CRDs for our agent an
 ```bash
 kubectl get agents,mcpservers,pods -n kagent
 ```
-[alt images](k-get-agents-mcpserver-pods.png)  
+[alt images](https://github.com/CoyApilado18/Deploy-a-Finance-Agent-on-Kubernetes/blob/119bae25f040e608215f0b3f8f54cec9d61a56b2/images/k-get-agents-mcpserver-pods.png)  
 
 
 • I see finance-agent listed as an Agent resource and finnhub-tools listed as an MCPServer resource. Both will show a NAME and AGE column confirming they are registered. I gave it 30 seconds as the kagent controller needs time to reconcile new CRDs after deployment.  
@@ -684,7 +694,7 @@ Open the kagent dashboard by running:
 kagent dashboard
 ```
 Output:  
-[alt images](kagent-dashboard.png)  
+[alt images](https://github.com/CoyApilado18/Deploy-a-Finance-Agent-on-Kubernetes/blob/119bae25f040e608215f0b3f8f54cec9d61a56b2/images/kagent-dashboard.png)  
 
 
 • Our browser opens to http://localhost:8082. Our finance-agent is listed alongside the demo agents.  
@@ -699,7 +709,7 @@ Before we run the next command, predict: will the agent respond with a real stoc
 kagent invoke --agent finance-agent --task "What is the current stock price of AAPL?" --stream
 ```
 Output:
-[alt images](kagent-invoke.png)  
+[alt images](https://github.com/CoyApilado18/Deploy-a-Finance-Agent-on-Kubernetes/blob/119bae25f040e608215f0b3f8f54cec9d61a56b2/images/kagent-invoke.png)  
 
 
 I see the agent stream a response that includes a real dollar amount for Apple's stock price, pulled live from Finnhub in a JSON format. The response includes the current price, daily change, and percentage change.  
