@@ -18,7 +18,7 @@ By the end of this project, we'll have:
 We'll deploy our finance-research agent in my local kubeadm Kubernetes cluster with 1 controlplane node and 1 worker node. If you want to install and build your own local Kubernetes cluster with kubeadm from scratch with min specifications inside Oracle Virtual Box, checkout my github repo: [Build-your-local-Kubernetes-cluster](https://github.com/CoyApilado18/Build-your-local-Kubernetes-cluster) 
 
 
-## Step 1. Install Docker, Minikube, and Python 
+## Step 1. Install Docker and Python 
 
 ### Install Docker 
 You can refer to the official documentation from Docker to install [Docker in Ubuntu](https://docs.docker.com/engine/install/ubuntu/). You may want to checkout `Uninstall old versions` first. As the Docker documentation states, "Your Linux distribution may provide unofficial Docker packages, which may conflict with the official packages provided by Docker. You must uninstall these packages before you install the official version of Docker Engine."  
